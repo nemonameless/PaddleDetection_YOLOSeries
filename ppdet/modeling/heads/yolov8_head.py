@@ -21,6 +21,7 @@ from paddle import ParamAttr
 from paddle.regularizer import L2Decay
 from ..initializer import constant_
 from ppdet.core.workspace import register
+from ppdet.utils.check import _IS_NPU
 
 from ..bbox_utils import batch_distance2bbox, bbox_iou, custom_ceil
 from ..assigners.utils import generate_anchors_for_grid_cell
@@ -996,7 +997,11 @@ def crop_mask(masks, boxes):
     x1, y1, x2, y2 = paddle.chunk(boxes[:, :, None], 4, axis=1)
     r = paddle.arange(w, dtype=x1.dtype)[None, None, :]
     c = paddle.arange(h, dtype=y1.dtype)[None, :, None]
-    return masks * ((r >= x1) * (r < x2) * (c >= y1) * (c < y2))
+    if _IS_NPU: # bool tensor broadcast multiply is extreamly slow on npu, so we cast it to float32.
+        m_dtype = masks.dtype
+        return masks * ((r >= x1).cast(m_dtype) * (r < x2).cast(m_dtype) * (c >= y1).cast(m_dtype) * (c < y2).cast(m_dtype))
+    else:
+        return masks * ((r >= x1) * (r < x2) * (c >= y1) * (c < y2))
 
 
 def process_mask_upsample(protos, masks_in, bboxes, shape):

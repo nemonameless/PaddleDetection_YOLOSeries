@@ -16,6 +16,7 @@ import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
 from ppdet.core.workspace import register
+from ppdet.utils.check import _IS_NPU
 
 from ..bbox_utils import batch_distance2bbox, custom_ceil
 from ..losses import GIoULoss
@@ -28,6 +29,10 @@ from .ppyoloe_head import ESEAttn
 
 __all__ = ['PPYOLOEInsHead']
 
+def custom_binary_cross_entropy_with_logits(x, y):
+    max_val = paddle.maximum(-x, paddle.to_tensor(0.0))
+    loss = (1 - y) * x + max_val + paddle.log(paddle.exp(-max_val) + paddle.exp(-x - max_val))
+    return loss
 
 @register
 class PPYOLOEInsHead(nn.Layer):
@@ -173,7 +178,10 @@ class PPYOLOEInsHead(nn.Layer):
         for i, feat in enumerate(feats):
             _, _, h, w = feat.shape
             l = h * w
-            avg_feat = F.adaptive_avg_pool2d(feat, (1, 1))
+            if _IS_NPU: # backward in avgpool is extremely slow in npu kernel, replace it with mean
+                avg_feat = feat.mean(axis=[2, 3], keepdim=True)
+            else:
+                avg_feat = F.adaptive_avg_pool2d(feat, (1, 1))
             cls_logit = self.pred_cls[i](self.stem_cls[i](feat, avg_feat) +
                                          feat)
             reg_distri = self.pred_reg[i](self.stem_reg[i](feat, avg_feat))
@@ -231,7 +239,10 @@ class PPYOLOEInsHead(nn.Layer):
             l = h * w
             feats_shapes.append(l)
 
-            avg_feat = F.adaptive_avg_pool2d(feat, (1, 1))
+            if _IS_NPU: # backward in avgpool is extremely slow in npu kernel, replace it with mean
+                avg_feat = feat.mean(axis=[2, 3], keepdim=True)
+            else:
+                avg_feat = F.adaptive_avg_pool2d(feat, (1, 1))
             cls_logit = self.pred_cls[i](self.stem_cls[i](feat, avg_feat) +
                                          feat)
             reg_dist = self.pred_reg[i](self.stem_reg[i](feat, avg_feat))
@@ -306,8 +317,14 @@ class PPYOLOEInsHead(nn.Layer):
         x1y1, x2y2 = paddle.split(bbox, 2, -1)
         lt = points - x1y1
         rb = x2y2 - points
-        return paddle.concat([lt, rb], -1).clip(self.reg_range[0],
-                                                self.reg_range[1] - 1 - 0.01)
+        if _IS_NPU: # npu clip kernel causes nan grad, replace it with maximum & minimum.
+            out = paddle.concat([lt, rb], -1)
+            out = paddle.maximum(out, paddle.to_tensor(self.reg_range[0], dtype=out.dtype))
+            out = paddle.minimum(out, paddle.to_tensor(self.reg_range[1] - 1 - 0.01, dtype=out.dtype))
+            return out
+        else:
+            return paddle.concat([lt, rb], -1).clip(self.reg_range[0],
+                                                    self.reg_range[1] - 1 - 0.01)
 
     def _df_loss(self, pred_dist, target, lower_bound=0):
         target_left = paddle.cast(target.floor(), 'int64')
@@ -396,7 +413,11 @@ class PPYOLOEInsHead(nn.Layer):
         if paddle.distributed.get_world_size() > 1:
             paddle.distributed.all_reduce(assigned_scores_sum)
             assigned_scores_sum /= paddle.distributed.get_world_size()
-        assigned_scores_sum = paddle.clip(assigned_scores_sum, min=1.)
+        if _IS_NPU: # npu clip kernel causes nan grad, replace it with maximum & minimum.
+            assigned_scores_sum = paddle.maximum(assigned_scores_sum, paddle.to_tensor(1., dtype=assigned_scores_sum.dtype))
+        else:
+            assigned_scores_sum = paddle.clip(assigned_scores_sum, min=1.)
+        
         loss_cls /= assigned_scores_sum
 
         # select positive samples mask
@@ -544,8 +565,13 @@ class PPYOLOEInsHead(nn.Layer):
         nmasks = 32
         pred_mask = (pred @proto.reshape([nmasks, -1])).reshape(
             [-1, *proto.shape[1:]])  # (n,32) @ (32,80,80) -> (n,80,80)
-        loss = F.binary_cross_entropy_with_logits(
-            pred_mask, gt_mask, reduction='none')
+
+        if _IS_NPU
+            # bce npu kernel causes nan grad, replace it with numeric stable custom implementation. 
+            loss = custom_binary_cross_entropy_with_logits(pred_mask, gt_mask)
+        else:
+            loss = F.binary_cross_entropy_with_logits(
+                pred_mask, gt_mask, reduction='none')
         return (crop_mask(loss, xyxy).mean(axis=(1, 2)) /
                 area.squeeze(-1)).sum()
 
@@ -586,7 +612,7 @@ class PPYOLOEInsHead(nn.Layer):
                         custom_ceil(mask_logits.shape[-1] / scale_factor[0][1])
                     ],
                     mode='bilinear',
-                    align_corners=False)[..., :int(ori_h), :int(ori_w)]
+                    align_corners=False)[..., :round(ori_h.item()), :round(ori_w.item())] # due to npu numeric error, we need to take round of img size.
             masks = mask_logits.squeeze(0)
             mask_pred = masks > self.mask_thr_binary
 
