@@ -566,7 +566,7 @@ class PPYOLOEInsHead(nn.Layer):
         pred_mask = (pred @proto.reshape([nmasks, -1])).reshape(
             [-1, *proto.shape[1:]])  # (n,32) @ (32,80,80) -> (n,80,80)
 
-        if _IS_NPU
+        if _IS_NPU:
             # bce npu kernel causes nan grad, replace it with numeric stable custom implementation. 
             loss = custom_binary_cross_entropy_with_logits(pred_mask, gt_mask)
         else:
